@@ -45,6 +45,7 @@ from transformers import (
 from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices, _sample_negative_indices
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
+import bitsandbytes as bnb
 
 logger = get_logger(__name__)
 
@@ -52,24 +53,11 @@ logger = get_logger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     parser.add_argument(
-        "--dataset_name",
+        "--data_dir",
         type=str,
         default=None,
-        help="The name of the dataset to use (via the datasets library).",
-    )
-    parser.add_argument(
-        "--dataset_config_names",
-        nargs="+",
-        type=str,
         required=True,
-        help="The configuration names of the dataset to use (via the datasets library).",
-    )
-    parser.add_argument(
-        "--dataset_split_names",
-        nargs="+",
-        type=str,
-        required=True,
-        help="The names of the training data set splits to use (via the datasets library).",
+        help="The name of the folder with audio files.",
     )
     parser.add_argument(
         "--preprocessing_num_workers",
@@ -301,6 +289,22 @@ class DataCollatorForWav2Vec2Pretraining:
             return_tensors="pt",
         )
 
+        batch_dur     = 0
+        batch_padding = []
+
+        for raw_feats, padded_feats in zip(features, batch['input_values']):
+            raw_feat_len = len(raw_feats['input_values'])
+            batch_dur += raw_feat_len / 16_000
+
+            pad_feat_len = len(padded_feats)
+            pc_padding = (pad_feat_len - raw_feat_len) / pad_feat_len * 100
+
+            batch_padding.append(pc_padding)
+
+            # print(f"{raw_feat_len=}, {pad_feat_len=}, {pc_padding=}")
+
+        print(f"Batch size: {len(features)}, Total duration: {batch_dur:.2f}, Percent padding: {sum(batch_padding) / len(batch_padding):.2f}%")
+
         device = batch["input_values"].device
         batch_size = batch["input_values"].shape[0]
 
@@ -356,6 +360,293 @@ def get_grad_norm(params, scale=1):
     total_norm = total_norm**0.5
     return total_norm
 
+# Modified prepare_data_loader function from https://github.com/huggingface/accelerate/blob/cf22df91899dd57ead1df6c30983261596da7c99/src/accelerate/data_loader.py
+
+from torch.utils.data import BatchSampler, DataLoader, IterableDataset
+from accelerate.state import AcceleratorState, DistributedType
+from accelerate.utils import (
+    RNGType,
+    is_torch_version
+)
+from accelerate.data_loader import IterableDatasetShard, BatchSamplerShard, DataLoaderShard, DataLoaderDispatcher
+
+# kwargs of the DataLoader in min version 1.4.0.
+_PYTORCH_DATALOADER_KWARGS = {
+    "batch_size": 1,
+    "shuffle": False,
+    "sampler": None,
+    "batch_sampler": None,
+    "num_workers": 0,
+    "collate_fn": None,
+    "pin_memory": False,
+    "drop_last": False,
+    "timeout": 0,
+    "worker_init_fn": None,
+    "multiprocessing_context": None,
+    "generator": None,
+}
+
+class moddedBatchSamplerShard(BatchSamplerShard):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def _iter_with_no_split(self):
+        initial_data = []
+        batch_to_yield = []
+        for idx, batch in enumerate(self.batch_sampler):
+            # We gather the initial indices in case we need to circle back at the end.
+            if not self.drop_last and idx < self.num_processes:
+                initial_data += batch
+            # We identify the batch to yield but wait until we ar sure every process gets a full batch before actually
+            # yielding it.
+            if idx % self.num_processes == self.process_index:
+                batch_to_yield = batch
+            if idx % self.num_processes == self.num_processes - 1 and (
+                self.batch_size is None or len(batch) == self.batch_size
+            ):
+                # print(batch_to_yield)
+                yield batch_to_yield
+                batch_to_yield = []
+
+def dbs_prepare_data_loader(
+    dbs_args: dict,
+    dataloader: DataLoader,
+    device: Optional[torch.device] = None,
+    num_processes: Optional[int] = None,
+    process_index: Optional[int] = None,
+    split_batches: bool = False,
+    put_on_device: bool = False,
+    rng_types: Optional[List[Union[str, RNGType]]] = None,
+    dispatch_batches: Optional[bool] = None,
+    even_batches: bool = False
+) -> DataLoader:
+    """
+    Wraps a PyTorch `DataLoader` to generate batches for one of the processes only.
+    Depending on the value of the `drop_last` attribute of the `dataloader` passed, it will either stop the iteration
+    at the first batch that would be too small / not present on all processes or loop with indices from the beginning.
+    Args:
+        dataloader (`torch.utils.data.dataloader.DataLoader`):
+            The data loader to split across several devices.
+        device (`torch.device`):
+            The target device for the returned `DataLoader`.
+        num_processes (`int`, *optional*):
+            The number of processes running concurrently. Will default to the value given by
+            [`~state.AcceleratorState`].
+        process_index (`int`, *optional*):
+            The index of the current process. Will default to the value given by [`~state.AcceleratorState`].
+        split_batches (`bool`, *optional*, defaults to `False`):
+            Whether the resulting `DataLoader` should split the batches of the original data loader across devices or
+            yield full batches (in which case it will yield batches starting at the `process_index`-th and advancing of
+            `num_processes` batches at each iteration).
+            Another way to see this is that the observed batch size will be the same as the initial `dataloader` if
+            this option is set to `True`, the batch size of the initial `dataloader` multiplied by `num_processes`
+            otherwise.
+            Setting this option to `True` requires that the batch size of the `dataloader` is a round multiple of
+            `batch_size`.
+        put_on_device (`bool`, *optional*, defaults to `False`):
+            Whether or not to put the batches on `device` (only works if the batches are nested list, tuples or
+            dictionaries of tensors).
+        rng_types (list of `str` or [`~utils.RNGType`]):
+            The list of random number generators to synchronize at the beginning of each iteration. Should be one or
+            several of:
+            - `"torch"`: the base torch random number generator
+            - `"cuda"`: the CUDA random number generator (GPU only)
+            - `"xla"`: the XLA random number generator (TPU only)
+            - `"generator"`: the `torch.Generator` of the sampler (or batch sampler if there is no sampler in your
+              dataloader) or of the iterable dataset (if it exists) if the underlying dataset is of that type.
+        dispatch_batches (`bool`, *optional*):
+            If set to `True`, the datalaoder prepared is only iterated through on the main process and then the batches
+            are split and broadcast to each process. Will default to `True` when the underlying dataset is an
+            `IterableDataset`, `False` otherwise.
+        even_batches (`bool`, *optional*, defaults to `True`):
+            If set to `True`, in cases where the total batch size across all processes does not exactly divide the
+            dataset, samples at the start of the dataset will be duplicated so the batch can be divided equally among
+            all workers.
+    Returns:
+        `torch.utils.data.dataloader.DataLoader`: A new data loader that will yield the portion of the batches
+    <Tip warning={true}>
+    `BatchSampler`s with varying batch sizes are not enabled by default. To enable this behaviour, set `even_batches`
+    equal to `False`
+    </Tip>
+    """
+    if dispatch_batches is None:
+        if is_torch_version("<", "1.8.0") or not put_on_device:
+            dispatch_batches = False
+        else:
+            dispatch_batches = isinstance(dataloader.dataset, IterableDataset)
+
+    if dispatch_batches and not put_on_device:
+        raise ValueError("Using `dispatch_batches=True` requires `put_on_device=True`.")
+    # Grab defaults from AcceleratorState
+    state = AcceleratorState()
+    if num_processes is None:
+        num_processes = state.num_processes
+    if process_index is None:
+        process_index = state.process_index
+
+    # Sanity check
+    if split_batches and dataloader.batch_size > 1 and dataloader.batch_size % num_processes != 0:
+        raise ValueError(
+            f"To use a `DataLoader` in `split_batches` mode, the batch size ({dataloader.batch_size}) "
+            f"needs to be a round multiple of the number of processes ({num_processes})."
+        )
+
+    new_dataset_lengths = dataloader.dataset['input_length_secs']
+
+    new_dataset = dataloader.dataset.remove_columns('input_length_secs')
+    # Iterable dataset doesn't like batch_sampler, but data_loader creates a default one for it
+    new_batch_sampler = dataloader.batch_sampler if not isinstance(new_dataset, IterableDataset) else None
+    sampler_is_batch_sampler = False
+    synchronized_generator = None
+
+    from speechbrain.dataio.sampler import DynamicBatchSampler
+
+    # Make new_dataset compatible with structure DynamicBatchSampler() expects
+    new_dataset.data_ids = None
+
+    dynamic_batch_sampler = DynamicBatchSampler(
+        dataset=new_dataset,
+        lengths_list=new_dataset_lengths,
+        # lengths_list=[ len(i)/16_000 for i in new_dataset['input_values'] ],
+        drop_last=True,
+        **dbs_args
+    )
+
+    dynamic_batch_sampler = moddedBatchSamplerShard(
+                dynamic_batch_sampler,
+                num_processes=num_processes,
+                process_index=process_index,
+                split_batches=split_batches,
+                even_batches=even_batches,
+            )
+
+    # No change if no multiprocess
+    if (num_processes != 1 or state.distributed_type == DistributedType.MEGATRON_LM) and not dispatch_batches:
+        if isinstance(new_dataset, IterableDataset):
+            if getattr(dataloader.dataset, "generator", None) is not None:
+                synchronized_generator = dataloader.dataset.generator
+            new_dataset = IterableDatasetShard(
+                new_dataset,
+                batch_size=dataloader.batch_size,
+                drop_last=dataloader.drop_last,
+                num_processes=num_processes,
+                process_index=process_index,
+                split_batches=split_batches,
+            )
+        else:
+            # New batch sampler for the current process.
+            sampler_is_batch_sampler = isinstance(dataloader.sampler, BatchSampler)
+            if sampler_is_batch_sampler:
+                sampler = dataloader.sampler.sampler
+            else:
+                sampler = dataloader.batch_sampler.sampler
+            if hasattr(sampler, "generator"):
+                if sampler.generator is None:
+                    sampler.generator = torch.Generator()
+                synchronized_generator = sampler.generator
+
+            batch_sampler = dataloader.sampler if sampler_is_batch_sampler else dataloader.batch_sampler
+            new_batch_sampler = BatchSamplerShard(
+                batch_sampler,
+                num_processes=num_processes,
+                process_index=process_index,
+                split_batches=split_batches,
+                even_batches=even_batches,
+            )
+
+    # We ignore all of those since they are all dealt with by our new_batch_sampler
+    ignore_kwargs = [
+        "batch_size",
+        "shuffle",
+        "sampler",
+        "batch_sampler",
+        "drop_last",
+    ]
+
+    if rng_types is not None and synchronized_generator is None and "generator" in rng_types:
+        rng_types.remove("generator")
+
+    kwargs = {
+        k: getattr(dataloader, k, _PYTORCH_DATALOADER_KWARGS[k])
+        for k in _PYTORCH_DATALOADER_KWARGS
+        if k not in ignore_kwargs
+    }
+
+    # Need to provide batch_size as batch_sampler is None for Iterable dataset
+    if new_batch_sampler is None:
+        kwargs["drop_last"] = dataloader.drop_last
+        kwargs["batch_size"] = dataloader.batch_size // num_processes if split_batches else dataloader.batch_size
+
+    if dispatch_batches:
+        kwargs.pop("generator")
+        dataloader = DataLoaderDispatcher(
+            new_dataset,
+            split_batches=split_batches,
+            batch_sampler=new_batch_sampler,
+            _drop_last=dataloader.drop_last,
+            **kwargs,
+        )
+    elif sampler_is_batch_sampler:
+        dataloader = DataLoaderShard(
+            new_dataset,
+            device=device if put_on_device and state.distributed_type != DistributedType.TPU else None,
+            sampler=new_batch_sampler,
+            batch_size=dataloader.batch_size,
+            rng_types=rng_types,
+            synchronized_generator=synchronized_generator,
+            **kwargs,
+        )
+    else:
+        dataloader = DataLoaderShard(
+            new_dataset,
+            device=device if put_on_device and state.distributed_type != DistributedType.TPU else None,
+            batch_sampler=dynamic_batch_sampler,
+            rng_types=rng_types,
+            synchronized_generator=synchronized_generator,
+            **kwargs,
+        )
+
+    # if state.distributed_type == DistributedType.TPU:
+    #     return MpDeviceLoaderWrapper(dataloader, device)
+
+    return dataloader
+
+# Extended Accelerator class from https://github.com/huggingface/accelerate/blob/cf22df91899dd57ead1df6c30983261596da7c99/src/accelerate/accelerator.py
+
+class AcceleratorWithDynamicBatchSampling(Accelerator):
+
+    def __init__(self, dbs_args, *args, **kwargs):
+        self.dbs_args = dbs_args
+        super().__init__(*args, **kwargs)
+
+    def prepare_data_loader(self, data_loader: torch.utils.data.DataLoader, device_placement=None):
+        """
+        Prepares a PyTorch DataLoader for training in any distributed setup. It is recommended to use
+        [`Accelerator.prepare`] instead.
+        Args:
+            data_loader (`torch.utils.data.DataLoader`):
+                A vanilla PyTorch DataLoader to prepare
+            device_placement (`bool`, *optional*):
+                Whether or not to place the batches on the proper device in the prepared dataloader. Will default to
+                `self.device_placement`.
+        """
+        if device_placement is None:
+            device_placement = self.device_placement if self.distributed_type != DistributedType.TPU else False
+        prepared_data_loader = dbs_prepare_data_loader(
+            self.dbs_args,
+            data_loader,
+            self.device,
+            num_processes=self.num_processes,
+            process_index=self.process_index,
+            split_batches=self.split_batches,
+            put_on_device=device_placement,
+            rng_types=self.rng_types.copy(),
+            dispatch_batches=self.dispatch_batches,
+            even_batches=False,
+        )
+        self._dataloaders.append(prepared_data_loader)
+        return prepared_data_loader
 
 def main():
     # See all possible arguments in src/transformers/args.py
@@ -368,7 +659,16 @@ def main():
     send_example_telemetry("run_wav2vec2_pretraining_no_trainer", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    accelerator = Accelerator()
+    accelerator = AcceleratorWithDynamicBatchSampling(
+        dbs_args={
+            "max_batch_length" : 5,
+            "num_buckets" : 20,
+            "batch_ordering" : "ascending",
+            "shuffle" : False
+        },
+        even_batches=False
+    )
+
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
@@ -399,27 +699,11 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    # 1. Download and create train, validation dataset
-    # We load all dataset configuration and datset split pairs passed in
-    # ``args.dataset_config_names`` and ``args.dataset_split_names``
-    datasets_splits = []
-    for dataset_config_name, train_split_name in zip(args.dataset_config_names, args.dataset_split_names):
-        # load dataset
-        dataset_split = load_dataset(
-            args.dataset_name,
-            dataset_config_name,
-            split=train_split_name,
-            cache_dir=args.cache_dir,
-        )
-        datasets_splits.append(dataset_split)
-
-    # Next, we concatenate all configurations and splits into a single training dataset
-    raw_datasets = DatasetDict()
-    if len(datasets_splits) > 1:
-        raw_datasets["train"] = concatenate_datasets(datasets_splits).shuffle(seed=args.seed)
-    else:
-        raw_datasets["train"] = datasets_splits[0]
-
+    raw_datasets = load_dataset("audiofolder",
+        data_dir=args.data_dir,
+        cache_dir=args.cache_dir,
+    )
+    
     # Take ``args.validation_split_percentage`` from the training dataset for the validation_split_percentage
     num_validation_samples = raw_datasets["train"].num_rows * args.validation_split_percentage // 100
 
@@ -462,6 +746,7 @@ def main():
         )
         batch["input_values"] = inputs.input_values[0]
         batch["input_length"] = len(inputs.input_values[0])
+        batch["input_length_secs"] = len(inputs.input_values[0]) / sample["sampling_rate"]
 
         return batch
 
@@ -518,22 +803,41 @@ def main():
     data_collator = DataCollatorForWav2Vec2Pretraining(
         model=model, feature_extractor=feature_extractor, pad_to_multiple_of=args.pad_to_multiple_of
     )
+
     train_dataloader = DataLoader(
         vectorized_datasets["train"],
-        shuffle=True,
+        # Don't shuffle dataset, let batch sampler decide order
+        shuffle=False,
         collate_fn=data_collator,
         batch_size=args.per_device_train_batch_size,
     )
+
     eval_dataloader = DataLoader(
         vectorized_datasets["validation"], collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
     )
 
+    from transformers.trainer_pt_utils import get_parameter_names
+
+    decay_parameters = get_parameter_names(model, [torch.nn.LayerNorm])
+    decay_parameters = [name for name in decay_parameters if "bias" not in name]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if n in decay_parameters],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if n not in decay_parameters],
+            "weight_decay": 0.0,
+        },
+    ]
+
     # Optimizer
-    optimizer = AdamW(
-        list(model.parameters()),
+    optimizer = bnb.optim.AdamW8bit(
+        params=optimizer_grouped_parameters,
         lr=args.learning_rate,
         betas=[args.adam_beta1, args.adam_beta2],
         eps=args.adam_epsilon,
+        weight_decay=args.weight_decay
     )
 
     # Prepare everything with our `accelerator`.
@@ -577,6 +881,7 @@ def main():
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
+
             # compute num of losses
             num_losses = batch["mask_time_indices"].sum()
             sub_attention_mask = batch.pop("sub_attention_mask", None)
