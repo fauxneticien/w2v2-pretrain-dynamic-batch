@@ -1,0 +1,8 @@
+data/*
+tmp/*
+models/*
+!tmp/.gitkeep
+!data/gos-demo
+!models/xls-r_300m/
+# Ignore model weights (but not *.json config files)
+models/xls-r_300m/pytorch_model.bin

@@ -128,16 +128,28 @@ def parse_args():
         help="Path to the validation cached file name",
     )
     parser.add_argument(
-        "--per_device_train_batch_size",
-        type=int,
-        default=8,
-        help="Batch size (per device) for the training dataloader.",
+        "--dbs_max_batch_length",
+        type=float,
+        default=4.0,
+        help="Dynamic batch sampling: maximum duration of batch per device in seconds",
     )
     parser.add_argument(
-        "--per_device_eval_batch_size",
+        "--dbs_num_buckets",
         type=int,
-        default=8,
-        help="Batch size (per device) for the evaluation dataloader.",
+        default=20,
+        help="Dynamic batch sampling: number of buckets to divide durations into",
+    )
+    parser.add_argument(
+        "--dbs_batch_ordering",
+        type=str,
+        default="ascending",
+        help="Dynamic batch sampling: how to sort examples (ascending, descending, random)",
+    )
+    parser.add_argument(
+        "--dbs_shuffle",
+        type=bool,
+        default=False,
+        help="Dynamic batch sampling: whether to shuffle at each epoch (don't use with ordering ascending or descending)",
     )
     parser.add_argument(
         "--learning_rate",
@@ -360,7 +372,7 @@ def get_grad_norm(params, scale=1):
     total_norm = total_norm**0.5
     return total_norm
 
-# Modified prepare_data_loader function from https://github.com/huggingface/accelerate/blob/cf22df91899dd57ead1df6c30983261596da7c99/src/accelerate/data_loader.py
+# Modified prepare_data_loader function and BatchSamplerShard class from https://github.com/huggingface/accelerate/blob/cf22df91899dd57ead1df6c30983261596da7c99/src/accelerate/data_loader.py
 
 from torch.utils.data import BatchSampler, DataLoader, IterableDataset
 from accelerate.state import AcceleratorState, DistributedType
@@ -386,9 +398,10 @@ _PYTORCH_DATALOADER_KWARGS = {
     "generator": None,
 }
 
-class moddedBatchSamplerShard(BatchSamplerShard):
+class VerboseBatchSamplerShard(BatchSamplerShard):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, verbose_iter, *args, **kwargs):
+        self.verbose_iter = verbose_iter
         super().__init__(*args, **kwargs)
 
     def _iter_with_no_split(self):
@@ -405,7 +418,10 @@ class moddedBatchSamplerShard(BatchSamplerShard):
             if idx % self.num_processes == self.num_processes - 1 and (
                 self.batch_size is None or len(batch) == self.batch_size
             ):
-                # print(batch_to_yield)
+                if self.verbose_iter:
+                    # Use verbose to check each device is getting a different set of examples
+                    print(batch_to_yield)
+
                 yield batch_to_yield
                 batch_to_yield = []
 
@@ -508,18 +524,18 @@ def dbs_prepare_data_loader(
     dynamic_batch_sampler = DynamicBatchSampler(
         dataset=new_dataset,
         lengths_list=new_dataset_lengths,
-        # lengths_list=[ len(i)/16_000 for i in new_dataset['input_values'] ],
         drop_last=True,
         **dbs_args
     )
 
-    dynamic_batch_sampler = moddedBatchSamplerShard(
-                dynamic_batch_sampler,
-                num_processes=num_processes,
-                process_index=process_index,
-                split_batches=split_batches,
-                even_batches=even_batches,
-            )
+    dynamic_batch_sampler = VerboseBatchSamplerShard(
+        verbose_iter=False,
+        batch_sampler=dynamic_batch_sampler,
+        num_processes=num_processes,
+        process_index=process_index,
+        split_batches=split_batches,
+        even_batches=even_batches,
+    )
 
     # No change if no multiprocess
     if (num_processes != 1 or state.distributed_type == DistributedType.MEGATRON_LM) and not dispatch_batches:
@@ -661,10 +677,10 @@ def main():
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     accelerator = AcceleratorWithDynamicBatchSampling(
         dbs_args={
-            "max_batch_length" : 5,
-            "num_buckets" : 20,
-            "batch_ordering" : "ascending",
-            "shuffle" : False
+            "max_batch_length" : args.dbs_max_batch_length,
+            "num_buckets" : args.dbs_num_buckets,
+            "batch_ordering" : args.dbs_batch_ordering,
+            "shuffle" : args.dbs_shuffle
         },
         even_batches=False
     )
@@ -808,12 +824,12 @@ def main():
         vectorized_datasets["train"],
         # Don't shuffle dataset, let batch sampler decide order
         shuffle=False,
-        collate_fn=data_collator,
-        batch_size=args.per_device_train_batch_size,
+        collate_fn=data_collator
     )
 
     eval_dataloader = DataLoader(
-        vectorized_datasets["validation"], collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
+        vectorized_datasets["validation"],
+        collate_fn=data_collator
     )
 
     from transformers.trainer_pt_utils import get_parameter_names
@@ -862,13 +878,13 @@ def main():
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # 5. Train
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    # total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(vectorized_datasets['train'])}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    # logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    # logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     completed_steps = 0
@@ -981,8 +997,12 @@ def main():
                 if (args.push_to_hub and epoch < args.num_train_epochs - 1) or args.output_dir is not None:
                     accelerator.wait_for_everyone()
                     unwrapped_model = accelerator.unwrap_model(model)
+
+                    cp_dir = os.path.join(args.output_dir, f"checkpoint-{step + 1}")
+                    os.makedirs(cp_dir, exist_ok = True)
+
                     unwrapped_model.save_pretrained(
-                        args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+                        cp_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
                     )
 
                 if (args.push_to_hub and epoch < args.num_train_epochs - 1) and accelerator.is_main_process:
@@ -1031,16 +1051,15 @@ def main():
             if is_wandb_available():
                 wandb.log(val_logs)
 
-        if args.output_dir is not None:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                if args.push_to_hub:
-                    repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
-
+        # if args.output_dir is not None:
+        #     accelerator.wait_for_everyone()
+        #     unwrapped_model = accelerator.unwrap_model(model)
+        #     unwrapped_model.save_pretrained(
+        #         args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
+        #     )
+        #     if accelerator.is_main_process:
+        #         if args.push_to_hub:
+        #             repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
 if __name__ == "__main__":
     main()
