@@ -49,8 +49,8 @@ accelerate launch run_wav2vec2_pretraining_no_trainer.py \
 	--min_duration_in_seconds="1" \
 	--gradient_accumulation_steps="2" \
 	--dbs_max_batch_length="5" \
-    --dbs_batch_ordering="ascending" \
-    --dbs_num_buckets="20" \
+	--dbs_batch_ordering="ascending" \
+	--dbs_num_buckets="20" \
 	--adam_beta1="0.9" \
 	--adam_beta2="0.98" \
 	--adam_epsilon="1e-06" \
